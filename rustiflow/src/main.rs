@@ -20,6 +20,7 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use common::{BasicFeaturesIpv4, BasicFeaturesIpv6};
+use priority_queue::PriorityQueue;
 use core::panic;
 use dashmap::DashMap;
 use flows::{
@@ -37,11 +38,7 @@ use pnet::packet::{
     Packet,
 };
 use std::{
-    fs::{File, OpenOptions},
-    io::{BufWriter, Read, Write},
-    ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    fs::{File, OpenOptions}, io::{BufWriter, Read, Write}, ops::{Deref, DerefMut}, sync::atomic::{AtomicUsize, Ordering}, time::{SystemTime, UNIX_EPOCH}
 };
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
@@ -464,6 +461,10 @@ where
 
     let flow_map_ipv6: Arc<DashMap<String, T>> = Arc::new(DashMap::new());
 
+    let expirations_ipv4: Arc<Mutex<PriorityQueue<String, Instant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+
+    let expirations_ipv6: Arc<Mutex<PriorityQueue<String, Instant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+
     let total_lost_events = Arc::new(AtomicUsize::new(0));
 
     // Use all online CPUs to process the events in the user space
@@ -471,6 +472,7 @@ where
         let mut buf_egress_ipv4 = flows_egress_ipv4.open(cpu_id, None)?;
         let flow_map_clone_egress_ipv4 = flow_map_ipv4.clone();
         let total_lost_events_clone_egress_ipv4 = total_lost_events.clone();
+        let expirations_ipv4_egress_clone = expirations_ipv4.clone();
 
         task::spawn(async move {
             // 10 buffers with 98_304 bytes each, meaning a capacity of 4096 packets per buffer (24 bytes per packet)
@@ -486,7 +488,7 @@ where
                     let ptr = buf.as_ptr() as *const BasicFeaturesIpv4;
                     let data = unsafe { ptr.read_unaligned() };
 
-                    process_packet_ipv4(&data, &flow_map_clone_egress_ipv4, false, None, None);
+                    process_packet_ipv4(&data, &flow_map_clone_egress_ipv4, &expirations_ipv4_egress_clone, lifespan, false, None, None);
                 }
             }
         });
@@ -494,6 +496,7 @@ where
         let mut buf_ingress_ipv4 = flows_ingress_ipv4.open(cpu_id, None)?;
         let flow_map_clone_ingress_ipv4 = flow_map_ipv4.clone();
         let total_lost_events_clone_ingress_ipv4 = total_lost_events.clone();
+        let expirations_ipv4_ingress_clone = expirations_ipv4.clone();
 
         task::spawn(async move {
             let mut buffers = (0..10)
@@ -508,7 +511,7 @@ where
                     let ptr = buf.as_ptr() as *const BasicFeaturesIpv4;
                     let data = unsafe { ptr.read_unaligned() };
 
-                    process_packet_ipv4(&data, &flow_map_clone_ingress_ipv4, true, None, None);
+                    process_packet_ipv4(&data, &flow_map_clone_ingress_ipv4, &expirations_ipv4_ingress_clone, lifespan, true, None, None);
                 }
             }
         });
@@ -516,6 +519,7 @@ where
         let mut buf_egress_ipv6 = flows_egress_ipv6.open(cpu_id, None)?;
         let flow_map_clone_egress_ipv6 = flow_map_ipv6.clone();
         let total_lost_events_clone_egress_ipv6 = total_lost_events.clone();
+        let expirations_ipv6_egress_clone = expirations_ipv6.clone();
 
         task::spawn(async move {
             // 10 buffers with 196_608 bytes each, meaning a capacity of 4096 packets per buffer (48 bytes per packet)
@@ -531,7 +535,7 @@ where
                     let ptr = buf.as_ptr() as *const BasicFeaturesIpv6;
                     let data = unsafe { ptr.read_unaligned() };
 
-                    process_packet_ipv6(&data, &flow_map_clone_egress_ipv6, false, None, None);
+                    process_packet_ipv6(&data, &flow_map_clone_egress_ipv6, &expirations_ipv6_egress_clone, lifespan, false, None, None);
                 }
             }
         });
@@ -539,6 +543,7 @@ where
         let mut buf_ingress_ipv6 = flows_ingress_ipv6.open(cpu_id, None)?;
         let flow_map_clone_ingress_ipv6 = flow_map_ipv6.clone();
         let total_lost_events_clone_ingress_ipv6 = total_lost_events.clone();
+        let expirations_ipv6_ingress_clone = expirations_ipv6.clone();
 
         task::spawn(async move {
             let mut buffers = (0..10)
@@ -553,7 +558,7 @@ where
                     let ptr = buf.as_ptr() as *const BasicFeaturesIpv6;
                     let data = unsafe { ptr.read_unaligned() };
 
-                    process_packet_ipv6(&data, &flow_map_clone_ingress_ipv6, true, None, None);
+                    process_packet_ipv6(&data, &flow_map_clone_ingress_ipv6, &expirations_ipv6_ingress_clone, lifespan, true, None, None);
                 }
             }
         });
@@ -700,6 +705,9 @@ where
     let flow_map_ipv4: Arc<DashMap<String, T>> = Arc::new(DashMap::new());
     let flow_map_ipv6: Arc<DashMap<String, T>> = Arc::new(DashMap::new());
 
+    let expirations_ipv4: Arc<Mutex<PriorityQueue<String, Instant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+    let expirations_ipv6: Arc<Mutex<PriorityQueue<String, Instant>>> = Arc::new(Mutex::new(PriorityQueue::new()));
+
     info!("Reading the pcap file: {:?} ...", path);
 
     let mut cap = match pcap::Capture::from_file(path) {
@@ -744,8 +752,7 @@ where
                             if amount_of_packets % 10_000 == 0 {
                                 info!("{} packets have been processed...", amount_of_packets);
                             }
-                            check_flows_to_expire(&flow_map_ipv4, lifespan, ts_datetime);
-                            redirect_packet_ipv4(&features_ipv4, &flow_map_ipv4, ts_instant, ts_datetime);
+                            redirect_packet_ipv4(&features_ipv4, &flow_map_ipv4, &expirations_ipv4, lifespan, ts_instant, ts_datetime);
                         }
                     }
                 }
@@ -756,8 +763,7 @@ where
                             if amount_of_packets % 10_000 == 0 {
                                 info!("{} packets have been processed...", amount_of_packets);
                             }
-                            check_flows_to_expire(&flow_map_ipv6, lifespan, ts_datetime);
-                            redirect_packet_ipv6(&features_ipv6, &flow_map_ipv6, ts_instant, ts_datetime);
+                            redirect_packet_ipv6(&features_ipv6, &flow_map_ipv6, &expirations_ipv6, lifespan, ts_instant, ts_datetime);
                         }
                     }
                 }
@@ -774,8 +780,7 @@ where
                                             amount_of_packets
                                         );
                                     }
-                                    check_flows_to_expire(&flow_map_ipv4, lifespan, ts_datetime);
-                                    redirect_packet_ipv4(&features_ipv4, &flow_map_ipv4, ts_instant, ts_datetime,);
+                                    redirect_packet_ipv4(&features_ipv4, &flow_map_ipv4, &expirations_ipv4, lifespan, ts_instant, ts_datetime);
                                 }
                             }
                         }
@@ -789,8 +794,7 @@ where
                                             amount_of_packets
                                         );
                                     }
-                                    check_flows_to_expire(&flow_map_ipv6, lifespan, ts_datetime);
-                                    redirect_packet_ipv6(&features_ipv6, &flow_map_ipv6, ts_instant, ts_datetime);
+                                    redirect_packet_ipv6(&features_ipv6, &flow_map_ipv6, &expirations_ipv6, lifespan, ts_instant, ts_datetime);
                                 }
                             }
                         }
@@ -837,33 +841,6 @@ where
         "Duration: {:?} milliseconds",
         end.duration_since(start).as_millis()
     );
-}
-
-fn check_flows_to_expire<T>(
-    flow_map: &Arc<DashMap<String, T>>,
-    lifespan: u64,
-    ts_datetime: DateTime<Utc>,
-) where
-    T: Flow,
-{
-    let mut keys_to_remove = Vec::new();
-    for entry in flow_map.iter() {
-        let flow = entry.value();
-        let duration = get_duration(flow.get_first_timestamp(), ts_datetime) / 1_000_000.0;
-
-        if duration >= lifespan as f64 {
-            if *NO_CONTAMINANT_FEATURES.lock().unwrap().deref() {
-                export(&flow.dump_without_contamination());
-            } else {
-                export(&flow.dump());
-            }
-            keys_to_remove.push(entry.key().clone());
-        }
-    }
-
-    for key in keys_to_remove {
-        flow_map.remove(&key);
-    }
 }
 
 /// Export the flow to the set export function.
@@ -927,6 +904,8 @@ fn export(output: &String) {
 fn process_packet_ipv4<T>(
     data: &BasicFeaturesIpv4,
     flow_map: &Arc<DashMap<String, T>>,
+    expirations: &Arc<Mutex<PriorityQueue<String, Instant>>>,
+    lifespan: u64,
     fwd: bool,
     timestamp: Option<Instant>,
     ts_datetime: Option<DateTime<Utc>>,
@@ -953,31 +932,8 @@ fn process_packet_ipv4<T>(
         length: data.length,
         window_size: data.window_size,
     };
-    let flow_id = if fwd {
-        create_flow_id(&source, data.port_source, &destination, data.port_destination, data.protocol)
-    } else {
-        create_flow_id(&destination, data.port_destination, &source, data.port_source, data.protocol)
-    };
-
-    let mut entry = flow_map.entry(flow_id.clone()).or_insert_with(|| {
-        if fwd {
-            T::new(flow_id.clone(), source, data.port_source, destination, data.port_destination, data.protocol, ts_date)
-        } else {
-            T::new(flow_id.clone(), destination, data.port_destination, source, data.port_source, data.protocol, ts_date)
-        }
-    });
-
-    let end = entry.update_flow(&features, &ts, ts_date, fwd);
-    if end.is_some() {
-        let flow = entry.value();
-        if *NO_CONTAMINANT_FEATURES.lock().unwrap().deref() {
-            export(&flow.dump_without_contamination());
-        } else {
-            export(&flow.dump());
-        }
-        drop(entry);
-        flow_map.remove(&flow_id);
-    }
+    
+    process_packet(source, destination, data.port_source, data.port_destination, data.protocol, ts, ts_date, &features, flow_map, expirations, lifespan, fwd)
 }
 
 /// Processes an ipv6 packet and updates the flow map.
@@ -991,6 +947,8 @@ fn process_packet_ipv4<T>(
 fn process_packet_ipv6<T>(
     data: &BasicFeaturesIpv6,
     flow_map: &Arc<DashMap<String, T>>,
+    expirations: &Arc<Mutex<PriorityQueue<String, Instant>>>,
+    lifespan: u64,
     fwd: bool,
     timestamp: Option<Instant>,
     ts_datetime: Option<DateTime<Utc>>,
@@ -1017,19 +975,67 @@ fn process_packet_ipv6<T>(
         window_size: data.window_size,
     };
 
+    process_packet(source, destination, data.port_source, data.port_destination, data.protocol, ts, ts_date, &features, flow_map, expirations, lifespan, fwd)
+}
+
+fn process_packet<T>(
+    source: std::net::IpAddr,
+    destination: std::net::IpAddr,
+    source_port: u16,
+    destination_port: u16,
+    protocol: u8,
+    ts: Instant,
+    ts_date: DateTime<Utc>,
+    features: &BasicFeatures,
+    flow_map: &Arc<DashMap<String, T>>,
+    expirations: &Arc<Mutex<PriorityQueue<String, Instant>>>,
+    lifespan: u64,
+    fwd: bool,
+)
+where
+    T: Flow,
+{
     let flow_id = if fwd {
-        create_flow_id(&source, data.port_source, &destination, data.port_destination, data.protocol)
+        create_flow_id(&source, source_port, &destination, destination_port, protocol)
     } else {
-        create_flow_id(&destination, data.port_destination, &source, data.port_source, data.protocol)
+        create_flow_id(&destination, destination_port, &source, source_port, protocol)
     };
 
     let mut entry = flow_map.entry(flow_id.clone()).or_insert_with(|| {
+
+        expirations.lock().unwrap().push(flow_id.clone(), ts + Duration::from_secs(lifespan));
+
         if fwd {
-            T::new(flow_id.clone(), source, data.port_source, destination, data.port_destination, data.protocol, ts_date)
+            T::new(flow_id.clone(), source, source_port, destination, destination_port, protocol, ts_date)
         } else {
-            T::new(flow_id.clone(), destination, data.port_destination, source, data.port_source, data.protocol, ts_date)
+            T::new(flow_id.clone(), destination, destination_port, source, source_port, protocol, ts_date)
         }
     });
+
+    let flows_to_remove = {
+        let expirations_to_remove = expirations.lock().unwrap();
+        let mut flows_to_remove = Vec::new();
+
+        for (flow_id, &expiration) in expirations_to_remove.iter() {
+            if expiration <= ts {
+                flows_to_remove.push(flow_id.clone());
+            } else {
+                break;
+            }
+        }
+
+        flows_to_remove
+    };
+
+    // Remove the expired flows
+    {
+        let mut expirations = expirations.lock().unwrap();
+
+        for flow_id in flows_to_remove {
+            expirations.remove(&flow_id);
+            flow_map.remove(&flow_id);
+        }
+    }
 
     let end = entry.update_flow(&features, &ts, ts_date, fwd);
     if end.is_some() {
@@ -1054,6 +1060,8 @@ fn process_packet_ipv6<T>(
 fn redirect_packet_ipv4<T>(
     features_ipv4: &BasicFeaturesIpv4,
     flow_map: &Arc<DashMap<String, T>>,
+    expirations: &Arc<Mutex<PriorityQueue<String, Instant>>>,
+    lifespan: u64,
     timestamp: Instant,
     ts_datetime: DateTime<Utc>,
 ) where
@@ -1068,7 +1076,7 @@ fn redirect_packet_ipv4<T>(
     );
 
     let add_fwd_direction = !flow_map.contains_key(&bwd_flow_id); // If not exists, create a new flow in the forward direction or add to existing fwd flow
-    process_packet_ipv4(&features_ipv4, &flow_map, add_fwd_direction, Some(timestamp), Some(ts_datetime));
+    process_packet_ipv4(&features_ipv4, &flow_map, &expirations, lifespan, add_fwd_direction, Some(timestamp), Some(ts_datetime));
 }
 
 /// Redirects an ipv6 packet to the correct flow.
@@ -1081,6 +1089,8 @@ fn redirect_packet_ipv4<T>(
 fn redirect_packet_ipv6<T>(
     features_ipv6: &BasicFeaturesIpv6,
     flow_map: &Arc<DashMap<String, T>>,
+    expirations: &Arc<Mutex<PriorityQueue<String, Instant>>>,
+    lifespan: u64,
     timestamp: Instant,
     ts_datetime: DateTime<Utc>,
 ) where
@@ -1095,7 +1105,7 @@ fn redirect_packet_ipv6<T>(
     );
 
     let add_fwd_direction = !flow_map.contains_key(&bwd_flow_id); // If not exists, create a new flow in the forward direction or add to existing fwd flow
-    process_packet_ipv6(&features_ipv6, &flow_map, add_fwd_direction, Some(timestamp), Some(ts_datetime));
+    process_packet_ipv6(&features_ipv6, &flow_map, &expirations, lifespan, add_fwd_direction, Some(timestamp), Some(ts_datetime));
 }
 
 /// Extracts the basic features of an ipv4 packet pnet struct.
@@ -1254,6 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn test_flow_termination() {
         let flow_map = Arc::new(DashMap::new());
+        let expiration = Arc::new(Mutex::new(PriorityQueue::new()));
 
         let data_1 = BasicFeaturesIpv4 {
             ipv4_source: 1,
@@ -1269,7 +1280,7 @@ mod tests {
             _padding: [0; 3],
         };
 
-        process_packet_ipv4::<CicFlow>(&data_1, &flow_map, true, None, None);
+        process_packet_ipv4::<CicFlow>(&data_1, &flow_map, &expiration, 60, true, None, None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1286,7 +1297,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_2, &flow_map, false, None, None);
+        process_packet_ipv4(&data_2, &flow_map, &expiration, 60, false, None, None);
 
         assert_eq!(flow_map.len(), 1);
         // 17 is for udp, here we just use it to create a new flow
@@ -1303,7 +1314,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_3, &flow_map, true, None, None);
+        process_packet_ipv4(&data_3, &flow_map, &expiration, 60, true, None, None);
 
         assert_eq!(flow_map.len(), 2);
 
@@ -1320,7 +1331,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_4, &flow_map, true, None, None);
+        process_packet_ipv4(&data_4, &flow_map, &expiration, 60, true, None, None);
 
         assert_eq!(flow_map.len(), 2);
 
@@ -1337,7 +1348,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_5, &flow_map, false, None ,None);
+        process_packet_ipv4(&data_5, &flow_map, &expiration, 60, false, None ,None);
 
         assert_eq!(flow_map.len(), 2);
 
@@ -1354,7 +1365,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_6, &flow_map, true, None ,None);
+        process_packet_ipv4(&data_6, &flow_map, &expiration, 60, true, None ,None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1371,7 +1382,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_7, &flow_map, false, None ,None);
+        process_packet_ipv4(&data_7, &flow_map, &expiration, 60, false, None ,None);
 
         assert_eq!(flow_map.len(), 0);
 
@@ -1388,7 +1399,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_8, &flow_map, true, None ,None);
+        process_packet_ipv4(&data_8, &flow_map, &expiration, 60, true, None ,None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1405,7 +1416,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_9, &flow_map, true, None ,None);
+        process_packet_ipv4(&data_9, &flow_map, &expiration, 60, true, None ,None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1423,7 +1434,7 @@ mod tests {
             _padding: [0; 3],
         };
 
-        process_packet_ipv4(&data_10, &flow_map, true, None ,None);
+        process_packet_ipv4(&data_10, &flow_map, &expiration, 60, true, None ,None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1440,7 +1451,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_11, &flow_map, false, None ,None);
+        process_packet_ipv4(&data_11, &flow_map, &expiration, 60, false, None ,None);
 
         assert_eq!(flow_map.len(), 1);
 
@@ -1457,7 +1468,7 @@ mod tests {
             window_size: 1000,
             _padding: [0; 3],
         };
-        process_packet_ipv4(&data_12, &flow_map, false, None ,None);
+        process_packet_ipv4(&data_12, &flow_map, &expiration, 60, false, None ,None);
 
         assert_eq!(flow_map.len(), 0);
     }
